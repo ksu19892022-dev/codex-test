@@ -1,0 +1,17 @@
+{
+  "name": "ai-assistant-lan",
+  "version": "1.1.0",
+  "description": "A local area network collaborative version of the AI assistant.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-cron": "^4.2.1",
+    "node-fetch": "^2.7.0",
+    "ws": "^8.18.3"
+  }
+}
