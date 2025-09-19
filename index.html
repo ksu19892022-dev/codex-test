@@ -167,6 +167,30 @@
             return task.type === 'task' && !task.startDate;
         };
 
+        const runTaskSearch = async (query, options = {}) => {
+            const trimmedQuery = (query || '').trim();
+            if (!trimmedQuery) return [];
+
+            const params = new URLSearchParams();
+            params.set('q', trimmedQuery);
+            if (options.type) params.set('type', options.type);
+            if (options.includeCompleted === false) params.set('includeCompleted', 'false');
+            if (options.scheduledOnly) params.set('scheduledOnly', 'true');
+            if (options.todoOnly) params.set('todoOnly', 'true');
+            if (options.notebook) params.set('notebook', options.notebook);
+            if (options.limit) params.set('limit', String(options.limit));
+
+            const response = await fetch(`/api/search/tasks?${params.toString()}`);
+            if (!response.ok) {
+                throw new Error('搜索服务暂时不可用，请稍后再试。');
+            }
+            const result = await response.json();
+            if (!Array.isArray(result)) {
+                throw new Error('搜索结果格式不正确。');
+            }
+            return result;
+        };
+
         // --- 把它放在所有 Icon 组件之后，App 组件之前 ---
 
         function CalendarModal({ task, onConfirm, onClose, onClear }) {
@@ -1261,7 +1285,11 @@
                     const now = new Date();
                     const timestamp = `${now.getFullYear()}${(now.getMonth()+1).toString().padStart(2,'0')}${now.getDate().toString().padStart(2,'0')}${now.getHours().toString().padStart(2,'0')}${now.getMinutes().toString().padStart(2,'0')}`;
                     const fileName = `ai-assistant_backup_${timestamp}.json`;
-                    const jsonString = `data:text/json;charset=utf-8,${encodeURIComponent(JSON.stringify(tasks, null, 2))}`;
+                    const exportPayload = {
+                        tasks,
+                        notebooks: workRecordNotebooks
+                    };
+                    const jsonString = `data:text/json;charset=utf-8,${encodeURIComponent(JSON.stringify(exportPayload, null, 2))}`;
                     const link = document.createElement("a");
                     link.href = jsonString;
                     link.download = fileName;
@@ -1279,10 +1307,18 @@
                 fileReader.readAsText(file, "UTF-8");
                 fileReader.onload = e => {
                     try {
-                        const importedTasks = JSON.parse(e.target.result);
-                        if (Array.isArray(importedTasks) && (importedTasks.length === 0 || importedTasks.every(t => typeof t === 'object' && t !== null && 'id' in t && 'title' in t))) {
-                            // 对于导入操作，我们发送一个特殊的指令来替换整个数据库
-                            sendAtomicUpdate('replaceAll', importedTasks, 'db', `从文件导入数据`);
+                        const importedContent = JSON.parse(e.target.result);
+                        let payload = null;
+                        if (Array.isArray(importedContent)) {
+                            payload = { tasks: importedContent, notebooks: workRecordNotebooks };
+                        } else if (importedContent && typeof importedContent === 'object') {
+                            const tasksFromFile = Array.isArray(importedContent.tasks) ? importedContent.tasks : [];
+                            const notebooksFromFile = Array.isArray(importedContent.notebooks) ? importedContent.notebooks : workRecordNotebooks;
+                            payload = { tasks: tasksFromFile, notebooks: notebooksFromFile };
+                        }
+
+                        if (payload) {
+                            sendAtomicUpdate('replaceAll', payload, 'db', `从文件导入数据`);
                             setToast({ show: true, message: '数据导入成功！', type: 'success' });
                         } else {
                             throw new Error("文件内容格式不正确。");
@@ -1351,19 +1387,17 @@
                         {currentView === 'todo' && (
                             <TodoView
                                 tasks={tasks}
-                                editingTask={editingTask} 
+                                editingTask={editingTask}
                                 expandedRawTextId={expandedRawTextId}
                                 handlers={handlers}
-                                callArkApi={callArkApi}
                             />
                         )}
                         {currentView === 'schedule' && (
                             <ScheduleView
                                 tasks={tasks}
-                                editingTask={editingTask} 
+                                editingTask={editingTask}
                                 expandedRawTextId={expandedRawTextId}
                                 handlers={handlers}
-                                callArkApi={callArkApi}
                             />
                         )}
                         {currentView === 'awaiting' && (
@@ -2987,7 +3021,7 @@
                             <div className="text-center py-10 px-4 bg-white rounded-xl shadow-md">
                                 <div className="flex justify-center items-center text-gray-500">
                                     <Loader className="mr-3" />
-                                    <span>AI正在检索亮点...</span>
+                                    <span>正在检索亮点...</span>
                                 </div>
                             </div>
                         ) : insightsToDisplay.length > 0 ? (
@@ -3199,7 +3233,7 @@
             );
         }
 
-        function TodoView({ tasks, callArkApi, ...props }) {
+        function TodoView({ tasks, ...props }) {
             const { handlers } = props;
             const [selectedTag, setSelectedTag] = useState(null);
             const [selectedTaskType, setSelectedTaskType] = useState(null);
@@ -3236,7 +3270,8 @@
             const visibleTasks = tasksToDisplay.slice(0, visibleCount);
 
             const handleSearch = async () => {
-                if (!searchQuery.trim()) return;
+                const trimmed = searchQuery.trim();
+                if (!trimmed) return;
                 setIsSearching(true);
                 setSearchResultIds(null);
                 setError('');
@@ -3244,16 +3279,13 @@
                 setSelectedTaskType(null);
                 setSelectedLocationScene(null);
                 setSelectedCategory(null);
-                
-                const prompt = `你是一个智能任务筛选助手。请根据用户的自然语言请求，从下面的待办任务列表中找出所有语义上匹配的条目。请重点分析任务的'title'和'rawText'字段。- 用户请求: '${searchQuery}' - 待办任务列表 (JSON): ${JSON.stringify(todoTasks.map(({isNew, ...rest}) => rest))} 请严格只返回一个包含所有匹配项ID的JSON数组 (e.g., [2, 8])。不要返回任何其他解释。如果找不到任何匹配项，请返回一个空数组 []。`;
+
                 try {
-                    const matchingIds = await callArkApi(prompt);
-                    if (Array.isArray(matchingIds)) {
-                        setSearchResultIds(matchingIds);
-                    } else { throw new Error("AI返回了意料之外的格式。"); }
+                    const results = await runTaskSearch(trimmed, { type: 'task', todoOnly: true });
+                    setSearchResultIds(results.map(item => item.id));
                 } catch (err) {
-                    console.error("待办事项AI查询错误:", err);
-                    setError(err.message || "无法连接到AI服务。");
+                    console.error("待办事项搜索错误:", err);
+                    setError(err.message || "搜索失败，请稍后再试。");
                     setSearchResultIds([]);
                 } finally { setIsSearching(false); }
             };
@@ -3299,7 +3331,7 @@
                             </div>
                         )}
                         {isSearching ? (
-                            <div className="text-center py-10 px-4 bg-white rounded-xl shadow-md"><div className="flex justify-center items-center text-gray-500"><Loader className="mr-3" /><span>AI正在检索任务...</span></div></div>
+                            <div className="text-center py-10 px-4 bg-white rounded-xl shadow-md"><div className="flex justify-center items-center text-gray-500"><Loader className="mr-3" /><span>正在检索任务...</span></div></div>
                             ) : visibleTasks.length > 0 ? (
                                 visibleTasks.map(task => 
                                 <TaskCard 
@@ -3328,7 +3360,7 @@
         }
         
 // --- 请用下面的代码完整替换旧的 ScheduleView 函数 ---
-        function ScheduleView({ tasks, callArkApi, ...props }) {
+        function ScheduleView({ tasks, ...props }) {
             const { handlers } = props;
             const [searchQuery, setSearchQuery] = useState('');
             const [isSearching, setIsSearching] = useState(false);
@@ -3444,22 +3476,19 @@
                 };
             }, [tasks, activeFilter]);
 
-            // 搜索功能 (保持不变)
             const handleSearch = async () => {
-                if (!searchQuery.trim()) return;
+                const trimmed = searchQuery.trim();
+                if (!trimmed) return;
                 setIsSearching(true);
                 setSearchResultIds(null);
                 setError('');
-                
-                const prompt = `你是一个智能任务筛选助手。请根据用户的自然语言请求，从下面的日程任务列表中找出所有语义上匹配的条目。请重点分析任务的'title'和'rawText'字段。- 用户请求: '${searchQuery}' - 日程任务列表 (JSON): ${JSON.stringify(tasks.filter(t => t.type ==='task' && !isTodoTask(t)).map(({isNew, ...rest}) => rest))} 请严格只返回一个包含所有匹配项ID的JSON数组 (e.g., [2, 8])。不要返回任何其他解释。如果找不到任何匹配项，请返回一个空数组 []。`;
+
                 try {
-                    const matchingIds = await callArkApi(prompt);
-                    if (Array.isArray(matchingIds)) {
-                        setSearchResultIds(matchingIds);
-                    } else { throw new Error("AI返回了意料之外的格式。"); }
+                    const results = await runTaskSearch(trimmed, { type: 'task', scheduledOnly: true });
+                    setSearchResultIds(results.map(item => item.id));
                 } catch (err) {
-                    console.error("日程安排AI查询错误:", err);
-                    setError(err.message || "无法连接到AI服务。");
+                    console.error("日程安排搜索错误:", err);
+                    setError(err.message || "搜索失败，请稍后再试。");
                     setSearchResultIds([]);
                 } finally { setIsSearching(false); }
             };
@@ -3530,7 +3559,7 @@
                             </div>
                         )}
                         {isSearching ? (
-                            <div className="text-center py-10 px-4 bg-white rounded-xl shadow-md"><div className="flex justify-center items-center text-gray-500"><Loader className="mr-3" /><span>AI正在检索任务...</span></div></div>
+                            <div className="text-center py-10 px-4 bg-white rounded-xl shadow-md"><div className="flex justify-center items-center text-gray-500"><Loader className="mr-3" /><span>正在检索日程...</span></div></div>
                         ) : tasksToDisplay.length > 0 ? (
                             tasksToDisplay.map(task => 
                                 <TaskCard 
@@ -3579,7 +3608,8 @@
                 : filteredByTagsIdeas;
 
             const handleIdeaSearch = async () => {
-                if (!focusQuery.trim()) return;
+                const trimmed = focusQuery.trim();
+                if (!trimmed) return;
                 setIsThinking(true);
                 setSearchResultIds(null);
                 setError('');
@@ -3588,15 +3618,12 @@
                 setSelectedLocationScene(null);
                 setSelectedCategory(null);
 
-                const prompt = `你是一个智能想法筛选助手。请根据用户的自然语言请求，从下面的想法列表中找出所有语义上匹配的条目。请重点分析想法的'title'和'rawText'字段。- 用户请求: '${focusQuery}' - 想法列表 (JSON): ${JSON.stringify(tasks.map(({isNew, ...rest}) => rest))} 请严格只返回一个包含所有匹配项ID的JSON数组 (e.g., [2, 8])。不要返回任何其他解释。如果找不到任何匹配项，请返回一个空数组 []。`;
                 try {
-                    const matchingIds = await callArkApi(prompt);
-                    if (Array.isArray(matchingIds)) {
-                        setSearchResultIds(matchingIds);
-                    } else { throw new Error("AI返回了意料之外的格式。"); }
+                    const results = await runTaskSearch(trimmed, { type: 'idea', includeCompleted: true });
+                    setSearchResultIds(results.map(item => item.id));
                 } catch (err) {
-                    console.error("想法空间AI查询错误:", err);
-                    setError(err.message || "无法连接到AI服务。");
+                    console.error("想法空间搜索错误:", err);
+                    setError(err.message || "搜索失败，请稍后再试。");
                     setSearchResultIds([]);
                 } finally { setIsThinking(false); }
             };
@@ -3641,7 +3668,7 @@
                         )}
 
                         {isThinking ? (
-                            <div className="text-center py-10 px-4 bg-white rounded-xl shadow-md"><div className="flex justify-center items-center text-gray-500"><Loader className="mr-3" /><span>AI正在检索想法...</span></div></div>
+                            <div className="text-center py-10 px-4 bg-white rounded-xl shadow-md"><div className="flex justify-center items-center text-gray-500"><Loader className="mr-3" /><span>正在检索想法...</span></div></div>
                         ) : displayedIdeas.length > 0 ? (
                             displayedIdeas.map(idea => 
                                 <TaskCard 
@@ -3697,36 +3724,23 @@
                 return sortedIdeas.filter(task => task.notebooks && task.notebooks.includes(activeFilterTag));
             }, [sortedIdeas, activeFilterTag]);
 
-            const displayedIdeas = searchResultIds !== null 
-                ? sortedIdeas.filter(idea => searchResultIds.includes(idea.id)) 
+            const displayedIdeas = searchResultIds !== null
+                ? sortedIdeas.filter(idea => searchResultIds.includes(idea.id))
                 : filteredIdeas;
 
             const handleIdeaSearch = async () => {
-                if (!focusQuery.trim()) return;
+                const trimmed = focusQuery.trim();
+                if (!trimmed) return;
                 setActiveFilterTag(null);
                 setIsThinking(true);
                 setSearchResultIds(null);
                 setError('');
-
-                const searchableRecords = tasks.map(record => {
-                    const project = allTasks.find(p => p.id === record.projectId);
-                    return {
-                        id: record.id,
-                        title: record.title,
-                        rawText: record.rawText,
-                        projectName: project ? project.title : null
-                    };
-                });
-
-                const prompt = `你是一个智能工作记录筛选助手。请根据用户的自然语言请求，从下面的工作记录列表中找出所有语义上匹配的条目。请重点分析每条记录的 'title', 'rawText', 以及它所属的 'projectName' 字段。- 用户请求: '${focusQuery}' - 工作记录列表 (JSON): ${JSON.stringify(searchableRecords)} 请严格只返回一个包含所有匹配项ID的JSON数组 (e.g., [2, 8])。不要返回任何其他解释。如果找不到任何匹配项，请返回一个空数组 []。`;
                 try {
-                    const matchingIds = await callArkApi(prompt);
-                    if (Array.isArray(matchingIds)) {
-                        setSearchResultIds(matchingIds);
-                    } else { throw new Error("AI返回了意料之外的格式。"); }
+                    const results = await runTaskSearch(trimmed, { type: 'work_record', includeCompleted: true });
+                    setSearchResultIds(results.map(item => item.id));
                 } catch (err) {
-                    console.error("工作记录AI查询错误:", err);
-                    setError(err.message || "无法连接到AI服务。");
+                    console.error("工作记录搜索错误:", err);
+                    setError(err.message || "搜索失败，请稍后再试。");
                     setSearchResultIds([]);
                 } finally { setIsThinking(false); }
             };
@@ -3774,7 +3788,7 @@
                     {/* --- END: 替换结束 --- */}
 
                         {isThinking ? (
-                            <div className="text-center py-10 px-4 bg-white rounded-xl shadow-md"><div className="flex justify-center items-center text-gray-500"><Loader className="mr-3" /><span>AI正在检索记录...</span></div></div>
+                            <div className="text-center py-10 px-4 bg-white rounded-xl shadow-md"><div className="flex justify-center items-center text-gray-500"><Loader className="mr-3" /><span>正在检索记录...</span></div></div>
                         ) : displayedIdeas.length > 0 ? (
                             displayedIdeas.map(idea => 
                                 <TaskCard 

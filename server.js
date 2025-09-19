@@ -7,12 +7,16 @@ const fs = require('fs');
 const os = require('os');
 const fetch = require('node-fetch');
 const cron = require('node-cron');
+const storage = require('./storage');
 
 // --- 基础配置 ---
 const PORT = 8602;
-const DB_FILE = path.join(__dirname, 'db.json');
 const BACKUP_DIR = path.join(__dirname, 'backups');
 const MAX_BACKUPS = 10;
+
+const storagePaths = storage.getDataPaths();
+const LEGACY_JSON_FILE = storagePaths.legacyJson;
+const STATE_FILE = storagePaths.stateFile;
 
 // [安全更新] 从环境变量或直接从代码中获取 AI API Key
 const ARK_API_KEY = "5cc4ad2f-86f1-4948-bad6-ab9646d1fda9";
@@ -27,83 +31,56 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // --- 数据处理 ---
-// [核心修改] db 现在是一个包含 tasks 和 notebooks 的对象
-let db = {};
+let memoryState = storage.exportState();
+let snapshotTimer = null;
 
-// 保存数据到 JSON 文件
-function saveDB() {
+function writeJsonSnapshot() {
     try {
-        fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), 'utf8');
-        console.log('[OK] 数据已成功写入 db.json');
+        fs.writeFileSync(LEGACY_JSON_FILE, JSON.stringify(memoryState, null, 2), 'utf8');
     } catch (error) {
-        console.error('写入数据到 db.json 失败:', error);
+        console.error('[Snapshot] 写入 db.json 失败:', error);
     }
 }
 
-// [核心修改] 从 JSON 文件加载数据，并处理数据迁移
-function loadDB() {
-    try {
-        // 默认的笔记本分类
-        const defaultNotebooks = ['工厂管理', '陶瓷工艺', '文旅笔记', '业务管理', '团队协作', '客户沟通', '财务流程', '其他'];
-
-        if (fs.existsSync(DB_FILE)) {
-            const data = fs.readFileSync(DB_FILE, 'utf8');
-            const jsonData = JSON.parse(data);
-            
-            // 检查是旧的数组格式还是新的对象格式
-            if (Array.isArray(jsonData)) {
-                console.log('[Migration] 检测到旧的数组格式数据，正在迁移...');
-                db = {
-                    tasks: jsonData,
-                    notebooks: defaultNotebooks
-                };
-                saveDB(); // 迁移后立即保存为新格式
-            } else {
-                db = jsonData;
-                // 确保 notebooks 字段存在，如果不存在则添加
-                if (!db.notebooks || !Array.isArray(db.notebooks)) {
-                    console.log('[Migration] 数据中缺少笔记本列表，正在添加默认列表...');
-                    db.notebooks = defaultNotebooks;
-                    saveDB();
-                }
-            }
-            console.log('成功从 db.json 加载了数据。');
-        } else {
-            console.log('未找到 db.json，将使用空数据结构启动。');
-            db = { tasks: [], notebooks: defaultNotebooks };
-        }
-    } catch (error) {
-        console.error('读取 db.json 文件失败:', error);
-        db = { tasks: [], notebooks: [] }; // 如果文件损坏，则使用空结构启动
+function scheduleJsonSnapshot() {
+    if (snapshotTimer) {
+        clearTimeout(snapshotTimer);
     }
+    snapshotTimer = setTimeout(() => {
+        writeJsonSnapshot();
+        snapshotTimer = null;
+    }, 1500);
 }
 
-
-// 启动时加载数据
-loadDB();
+function refreshMemoryState() {
+    memoryState = storage.exportState();
+}
 
 // --- START: 一次性数据迁移脚本 ---
 function migrateWorkIdeasToRecords() {
     let migratedCount = 0;
     console.log('[Migration] 正在检查是否需要将 work_idea 迁移到 work_record...');
 
-    // [核心修改] 遍历 db.tasks 而不是 db
-    db.tasks.forEach(item => {
+    memoryState.tasks.forEach((item, index) => {
         if (item.type === 'work_idea') {
-            item.type = 'work_record';
-            if (item.tags && Array.isArray(item.tags)) {
-                const tagIndex = item.tags.indexOf('工作想法');
+            const updated = { ...item, type: 'work_record' };
+            if (Array.isArray(updated.tags)) {
+                const tagIndex = updated.tags.indexOf('工作想法');
                 if (tagIndex > -1) {
-                    item.tags[tagIndex] = '工作记录';
+                    updated.tags[tagIndex] = '工作记录';
                 }
             }
-            migratedCount++;
+            const normalized = storage.persistTask(updated);
+            if (normalized) {
+                memoryState.tasks[index] = normalized;
+                migratedCount++;
+            }
         }
     });
 
     if (migratedCount > 0) {
         console.log(`[Migration] 成功迁移了 ${migratedCount} 条“工作想法”到“工作记录”。`);
-        saveDB();
+        scheduleJsonSnapshot();
     } else {
         console.log('[Migration] 无需迁移，数据已是最新格式。');
     }
@@ -111,27 +88,40 @@ function migrateWorkIdeasToRecords() {
 migrateWorkIdeasToRecords();
 // --- END: 一次性数据迁移脚本 ---
 
+writeJsonSnapshot();
+
 // --- 备份与清理功能 ---
 function createBackup() {
     try {
-        if (!fs.existsSync(DB_FILE)) return;
+        if (!fs.existsSync(STATE_FILE)) return;
         if (!fs.existsSync(BACKUP_DIR)) {
             fs.mkdirSync(BACKUP_DIR, { recursive: true });
         }
         const now = new Date();
         const timestamp = now.toISOString().replace(/[:.]/g, '-');
-        const backupFileName = `backup-${timestamp}.json`;
-        const backupFilePath = path.join(BACKUP_DIR, backupFileName);
-        fs.copyFileSync(DB_FILE, backupFilePath);
-        console.log(`[Backup] 成功创建备份文件: ${backupFileName}`);
-        const backupFiles = fs.readdirSync(BACKUP_DIR)
-            .filter(file => file.startsWith('backup-') && file.endsWith('.json'))
+        const stateBackupName = `backup-${timestamp}.state.json`;
+        const stateBackupPath = path.join(BACKUP_DIR, stateBackupName);
+        fs.copyFileSync(STATE_FILE, stateBackupPath);
+
+        const exportBackupName = `backup-${timestamp}.export.json`;
+        const exportBackupPath = path.join(BACKUP_DIR, exportBackupName);
+        fs.writeFileSync(exportBackupPath, JSON.stringify(memoryState, null, 2), 'utf8');
+
+        console.log(`[Backup] 已生成备份: ${stateBackupName} & ${exportBackupName}`);
+
+        const stateBackups = fs.readdirSync(BACKUP_DIR)
+            .filter(file => file.startsWith('backup-') && file.endsWith('.state.json'))
             .sort()
             .reverse();
-        if (backupFiles.length > MAX_BACKUPS) {
-            const filesToDelete = backupFiles.slice(MAX_BACKUPS);
+        if (stateBackups.length > MAX_BACKUPS) {
+            const filesToDelete = stateBackups.slice(MAX_BACKUPS);
             filesToDelete.forEach(file => {
                 fs.unlinkSync(path.join(BACKUP_DIR, file));
+                const jsonFile = file.replace(/\.state\.json$/, '.export.json');
+                const jsonPath = path.join(BACKUP_DIR, jsonFile);
+                if (fs.existsSync(jsonPath)) {
+                    fs.unlinkSync(jsonPath);
+                }
                 console.log(`[Backup] 已删除旧备份文件: ${file}`);
             });
         }
@@ -161,86 +151,112 @@ function handleAtomicUpdate(payload) {
     let updateSuccessful = false;
 
     console.log(`[Atomic Op] 收到指令: ${logAction || `${entity}.${action}`} by ${userId || 'Unknown'}`);
-    
+
     if (entity === 'db') {
+        if (action === 'replaceAll') {
+            let tasksToImport = [];
+            let notebooksToImport = memoryState.notebooks;
+            if (Array.isArray(data)) {
+                tasksToImport = data;
+            } else if (data && typeof data === 'object') {
+                tasksToImport = Array.isArray(data.tasks) ? data.tasks : [];
+                if (Array.isArray(data.notebooks)) {
+                    notebooksToImport = data.notebooks;
+                }
+            }
+            storage.replaceAll({ tasks: tasksToImport, notebooks: notebooksToImport });
+            refreshMemoryState();
+            updateSuccessful = true;
+            console.log('[Atomic Op] 数据库已通过导入操作完全替换。');
+        }
+    } else if (entity === 'notebook') {
+        if (action === 'updateAll' && Array.isArray(data)) {
+            storage.replaceNotebooks(data);
+            memoryState.notebooks = storage.getAllNotebooks();
+            updateSuccessful = true;
+            console.log('[Atomic Op] 笔记本列表已完全更新。');
+        }
+    } else if (entity === 'task') {
         switch (action) {
-            case 'replaceAll':
-                if (data && data.tasks && Array.isArray(data.tasks)) {
-                    // [核心修改] 确保导入的数据也是新格式
-                    db.tasks = data.tasks;
-                    db.notebooks = data.notebooks || db.notebooks; // 保留笔记本或使用导入的
-                    updateSuccessful = true;
-                    console.log('[Atomic Op] 数据库已通过导入操作完全替换。');
+            case 'create': {
+                if (data && typeof data === 'object' && data.id !== undefined && data.id !== null) {
+                    const taskId = String(data.id);
+                    if (!memoryState.tasks.some(item => String(item.id) === taskId)) {
+                        const normalized = storage.persistTask({ ...data });
+                        if (normalized) {
+                            memoryState.tasks.unshift(normalized);
+                            updateSuccessful = true;
+                        }
+                    } else {
+                        console.warn(`[Atomic Op] 创建失败: ID 为 ${taskId} 的项目已存在。`);
+                    }
                 }
                 break;
-        }
-    }
-    // [新增] 处理 notebook 实体的更新
-    else if (entity === 'notebook') {
-        switch (action) {
-            case 'updateAll':
-                if (Array.isArray(data)) {
-                    db.notebooks = data;
-                    updateSuccessful = true;
-                    console.log('[Atomic Op] 笔记本列表已完全更新。');
+            }
+            case 'update': {
+                if (data && data.id !== undefined && data.id !== null) {
+                    const taskId = String(data.id);
+                    const itemIndex = memoryState.tasks.findIndex(item => String(item.id) === taskId);
+                    if (itemIndex > -1) {
+                        const updatedTask = { ...memoryState.tasks[itemIndex], ...data };
+                        const normalized = storage.persistTask(updatedTask);
+                        if (normalized) {
+                            memoryState.tasks[itemIndex] = normalized;
+                            updateSuccessful = true;
+                        }
+                    } else {
+                        console.warn(`[Atomic Op] 更新失败: 未找到 ID 为 ${taskId} 的项目。`);
+                    }
                 }
                 break;
-        }
-    } 
-    else if (entity === 'task') {
-        // [核心修改] 所有操作都针对 db.tasks
-        switch (action) {
-            case 'create':
-                if(data && typeof data === 'object' && data.id){
-                    if (!db.tasks.some(item => item.id === data.id)) {
-                        db.tasks.unshift(data);
+            }
+            case 'delete': {
+                if (data && data.id !== undefined && data.id !== null) {
+                    const taskId = String(data.id);
+                    const itemIndex = memoryState.tasks.findIndex(item => String(item.id) === taskId);
+                    if (itemIndex > -1) {
+                        storage.deleteTask(taskId);
+                        memoryState.tasks.splice(itemIndex, 1);
                         updateSuccessful = true;
                     } else {
-                        console.warn(`[Atomic Op] 创建失败: ID 为 ${data.id} 的项目已存在。`);
+                        console.warn(`[Atomic Op] 删除失败: 未找到 ID 为 ${taskId} 的项目。`);
                     }
                 }
                 break;
-
-            case 'update':
-                const itemIndex = db.tasks.findIndex(item => item.id === data.id);
-                if (itemIndex > -1) {
-                    db.tasks[itemIndex] = { ...db.tasks[itemIndex], ...data };
-                    updateSuccessful = true;
-                } else {
-                    console.warn(`[Atomic Op] 更新失败: 未找到 ID 为 ${data.id} 的项目。`);
-                }
-                break;
-
-            case 'delete':
-                const initialLength = db.tasks.length;
-                db.tasks = db.tasks.filter(item => item.id !== data.id);
-                if (db.tasks.length < initialLength) {
-                    updateSuccessful = true;
-                } else {
-                    console.warn(`[Atomic Op] 删除失败: 未找到 ID 为 ${data.id} 的项目。`);
-                }
-                break;
-            
-            case 'updateNested':
-                const parentIndex = db.tasks.findIndex(item => item.id === data.parentId);
-                if (parentIndex > -1) {
-                    const parentItem = db.tasks[parentIndex];
-                    if (!parentItem.savedInsights) {
-                        parentItem.savedInsights = [];
-                    }
-                    if (data.action === 'addInsight') {
-                        parentItem.savedInsights.push(data.insight);
-                        updateSuccessful = true;
-                    } else if (data.action === 'deleteInsight') {
-                        const insightsInitialLength = parentItem.savedInsights.length;
-                        parentItem.savedInsights = parentItem.savedInsights.filter(i => i.id !== data.insightId);
-                        if (parentItem.savedInsights.length < insightsInitialLength) {
-                            updateSuccessful = true;
+            }
+            case 'updateNested': {
+                if (data && data.parentId !== undefined && data.parentId !== null) {
+                    const taskId = String(data.parentId);
+                    const parentIndex = memoryState.tasks.findIndex(item => String(item.id) === taskId);
+                    if (parentIndex > -1) {
+                        const parentItem = {
+                            ...memoryState.tasks[parentIndex],
+                            savedInsights: Array.isArray(memoryState.tasks[parentIndex].savedInsights)
+                                ? [...memoryState.tasks[parentIndex].savedInsights]
+                                : []
+                        };
+                        if (data.action === 'addInsight' && data.insight) {
+                            parentItem.savedInsights.push(data.insight);
+                            const normalized = storage.persistTask(parentItem);
+                            if (normalized) {
+                                memoryState.tasks[parentIndex] = normalized;
+                                updateSuccessful = true;
+                            }
+                        } else if (data.action === 'deleteInsight' && data.insightId !== undefined) {
+                            const initialLength = parentItem.savedInsights.length;
+                            parentItem.savedInsights = parentItem.savedInsights.filter(i => i.id !== data.insightId);
+                            if (parentItem.savedInsights.length < initialLength) {
+                                const normalized = storage.persistTask(parentItem);
+                                if (normalized) {
+                                    memoryState.tasks[parentIndex] = normalized;
+                                    updateSuccessful = true;
+                                }
+                            }
                         }
                     }
                 }
                 break;
-                
+            }
             default:
                 console.warn(`[Atomic Op] 收到未知的原子操作: ${action}`);
                 return;
@@ -250,11 +266,10 @@ function handleAtomicUpdate(payload) {
     }
 
     if (updateSuccessful) {
-        saveDB();
-        // [核心修改] 广播整个 db 对象
+        scheduleJsonSnapshot();
         wss.broadcast({
             type: 'dbUpdated',
-            payload: db,
+            payload: memoryState,
         });
         console.log(`[WS] 数据已更新并广播给所有 ${wss.clients.size} 个客户端。`);
     }
@@ -263,9 +278,9 @@ function handleAtomicUpdate(payload) {
 
 wss.on('connection', function connection(ws) {
     console.log(`一个新的客户端已连接。当前在线: ${wss.clients.size} 人。`);
-    
+
     // [核心修改] 发送包含 tasks 和 notebooks 的完整状态
-    ws.send(JSON.stringify({ type: 'initialState', payload: db }));
+    ws.send(JSON.stringify({ type: 'initialState', payload: memoryState }));
 
     ws.on('message', function incoming(rawMessage) {
         try {
@@ -294,9 +309,33 @@ wss.on('connection', function connection(ws) {
 app.use(express.static(path.join(__dirname)));
 app.use(express.json());
 
-// [核心修改] API 端点现在返回 db.tasks
+// [核心修改] API 端点现在返回数据库中的任务快照
 app.get('/api/tasks', (req, res) => {
-    res.json(db.tasks || []);
+    res.json(memoryState.tasks || []);
+});
+
+app.get('/api/state', (req, res) => {
+    res.json(memoryState);
+});
+
+app.get('/api/search/tasks', (req, res) => {
+    try {
+        const { q = '', type, includeCompleted, scheduledOnly, todoOnly, notebook, limit } = req.query;
+        const parsedLimit = Math.max(1, Math.min(parseInt(limit, 10) || 50, 200));
+        const results = storage.searchTasks({
+            query: q,
+            type: type || undefined,
+            includeCompleted: includeCompleted === undefined ? true : includeCompleted !== 'false',
+            scheduledOnly: scheduledOnly === 'true',
+            todoOnly: todoOnly === 'true',
+            notebook: notebook || undefined,
+            limit: parsedLimit
+        });
+        res.json(results.map(({ task, score }) => ({ task, score, id: task.id })));
+    } catch (error) {
+        console.error('[Search] 查询失败:', error);
+        res.status(500).json({ error: '搜索失败，请稍后再试。' });
+    }
 });
 
 // AI 代理接口 (无修改)
